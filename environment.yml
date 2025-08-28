@@ -1,1 +1,15 @@
-
+name: MultimodalMIMIC
+channels:
+pytorch
+conda-forge
+dependencies:
+python=3.8
+pytorch
+transformers
+pandas
+numpy
+scikit-learn
+matplotlib
+seaborn
+tqdm
+jupyter
