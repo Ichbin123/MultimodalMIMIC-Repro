@@ -1,390 +1,412 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-import pandas as pd
+from torch.utils.data import DataLoader
 import numpy as np
-from sklearn.metrics import roc_auc_score, average_precision_score, f1_score
+from sklearn.metrics import f1_score, roc_auc_score, average_precision_score
+import wandb
 import os
 import json
 from tqdm import tqdm
-import matplotlib.pyplot as plt
+import argparse
 
-class MIMICDataset(Dataset):
-    """Dataset class for MIMIC-III multimodal data"""
-    def __init__(self, data_path, split='train', task='mortality', max_seq_len=48, max_notes=5):
-        self.data_path = data_path
-        self.split = split
-        self.task = task
-        self.max_seq_len = max_seq_len
-        self.max_notes = max_notes
-        
-        # Load data
-        self.load_data()
-        
-    def load_data(self):
-        """Load preprocessed MIMIC-III data"""
-        # Load time series data
-        ts_file = os.path.join(self.data_path, f'timeseries_{self.split}.csv')
-        self.ts_data = pd.read_csv(ts_file)
-        
-        # Load clinical notes
-        notes_file = os.path.join(self.data_path, f'notes_{self.split}.csv')
-        self.notes_data = pd.read_csv(notes_file)
-        
-        # Load labels
-        labels_file = os.path.join(self.data_path, f'labels_{self.split}.csv')
-        self.labels = pd.read_csv(labels_file)
-        
-        # Get unique patient IDs
-        self.patient_ids = self.labels['patient_id'].unique()
-        
-        # Time series features (assuming MIMIC-III benchmark features)
-        self.ts_features = [
-            'Capillary refill rate', 'Diastolic blood pressure', 'Fraction inspired oxygen',
-            'Glascow coma scale eye opening', 'Glascow coma scale motor response',
-            'Glascow coma scale total', 'Glascow coma scale verbal response',
-            'Glucose', 'Heart Rate', 'Height', 'Mean blood pressure', 'Oxygen saturation',
-            'Respiratory rate', 'Systolic blood pressure', 'Temperature', 'Weight', 'pH'
-        ]
-        
-    def __len__(self):
-        return len(self.patient_ids)
-    
-    def __getitem__(self, idx):
-        patient_id = self.patient_ids[idx]
-        
-        # Get time series data for this patient
-        patient_ts = self.ts_data[self.ts_data['patient_id'] == patient_id].copy()
-        patient_ts = patient_ts.sort_values('time')
-        
-        # Extract time series values and times
-        ts_values = patient_ts[self.ts_features].fillna(0).values  # Simple zero fill for missing
-        ts_times = patient_ts['time'].values
-        
-        # Pad or truncate to max_seq_len
-        if len(ts_values) > self.max_seq_len:
-            ts_values = ts_values[:self.max_seq_len]
-            ts_times = ts_times[:self.max_seq_len]
-        else:
-            # Pad with zeros
-            padding_len = self.max_seq_len - len(ts_values)
-            ts_values = np.pad(ts_values, ((0, padding_len), (0, 0)), 'constant')
-            ts_times = np.pad(ts_times, (0, padding_len), 'constant', constant_values=ts_times[-1] if len(ts_times) > 0 else 0)
-        
-        # Get clinical notes for this patient
-        patient_notes = self.notes_data[self.notes_data['patient_id'] == patient_id].copy()
-        patient_notes = patient_notes.sort_values('time')
-        
-        # Extract notes and times
-        notes_text = patient_notes['text'].tolist()[:self.max_notes]
-        notes_times = patient_notes['time'].values[:self.max_notes]
-        
-        # Pad notes if necessary
-        while len(notes_text) < self.max_notes:
-            notes_text.append("")
-            notes_times = np.append(notes_times, notes_times[-1] if len(notes_times) > 0 else 0)
-        
-        # Get label
-        label = self.labels[self.labels['patient_id'] == patient_id][self.task].iloc[0]
-        
-        # Create query times (regular intervals)
-        query_times = np.linspace(0, self.max_seq_len, self.max_seq_len)
-        
-        return {
-            'patient_id': patient_id,
-            'ts_data': torch.FloatTensor(ts_values),
-            'ts_times': torch.FloatTensor(ts_times),
-            'notes_text': notes_text,
-            'notes_times': torch.FloatTensor(notes_times),
-            'query_times': torch.FloatTensor(query_times),
-            'label': torch.LongTensor([label]) if self.task in ['mortality', 'phenotype'] else torch.FloatTensor([label])
-        }
+from data.data_loader import MIMICDataModule
+from models.utde import TimeSeriesModel
+from models.text_encoder import IrregularClinicalNotesModel
+from models.multimodal_fusion import MultimodalModel
+from experiments.config import get_config
 
-def collate_fn(batch):
-    """Custom collate function for batching"""
-    patient_ids = [item['patient_id'] for item in batch]
-    ts_data = torch.stack([item['ts_data'] for item in batch])
-    ts_times = torch.stack([item['ts_times'] for item in batch])
-    query_times = torch.stack([item['query_times'] for item in batch])
-    notes_times = torch.stack([item['notes_times'] for item in batch])
-    labels = torch.stack([item['label'] for item in batch])
-    
-    # Handle notes text (list of lists)
-    notes_text = [item['notes_text'] for item in batch]
-    
-    return {
-        'patient_ids': patient_ids,
-        'ts_data': ts_data,
-        'ts_times': ts_times,
-        'notes_text': notes_text,
-        'notes_times': notes_times,
-        'query_times': query_times,
-        'labels': labels
-    }
 
-class EHRTrainer:
-    """Training class for multimodal EHR model"""
-    def __init__(self, model, train_loader, val_loader, test_loader, config):
-        self.model = model
-        self.train_loader = train_loader
-        self.val_loader = val_loader
-        self.test_loader = test_loader
+class Trainer:
+    """Training class for multimodal medical prediction models"""
+    
+    def __init__(self, config, model_type='multimodal', task='48ihm'):
         self.config = config
-        
-        # Set device
+        self.model_type = model_type
+        self.task = task
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # Initialize data module
+        self.data_module = MIMICDataModule(
+            data_path=config['data_path'],
+            task=task,
+            batch_size=config['batch_size'],
+            max_notes=config.get('max_notes', 5)
+        )
+        
+        # Get data loaders
+        self.train_loader = self.data_module.get_dataloader('train', shuffle=True)
+        self.val_loader = self.data_module.get_dataloader('val', shuffle=False)
+        self.test_loader = self.data_module.get_dataloader('test', shuffle=False)
+        
+        # Get global means
+        self.global_means = self.data_module.get_global_means().to(self.device)
+        
+        # Initialize model
+        self.model = self._build_model()
         self.model.to(self.device)
         
-        # Set up optimizer and loss
-        self.optimizer = optim.Adam(self.model.parameters(), lr=config['learning_rate'])
-        if config['task'] == 'mortality':
-            self.criterion = nn.BCEWithLogitsLoss()
-        elif config['task'] == 'phenotype':
-            self.criterion = nn.BCEWithLogitsLoss()  # Multi-label classification
+        # Initialize optimizer and loss
+        self.optimizer = self._build_optimizer()
+        self.criterion = self._build_criterion()
         
         # Metrics tracking
+        self.best_val_score = 0.0
         self.train_losses = []
-        self.val_losses = []
-        self.best_val_score = 0
+        self.val_scores = []
         
-    def train_epoch(self):
+    def _build_model(self):
+        """Build model based on type and task"""
+        d_m = self.config['d_m']  # Number of time series features
+        d_h = self.config['hidden_dim']
+        alpha = self.config['alpha']
+        num_classes = 1 if self.task == '48ihm' else 25  # Binary vs multi-label
+        
+        if self.model_type == 'time_series':
+            model = TimeSeriesModel(
+                d_m=d_m, d_h=d_h, alpha=alpha, 
+                gate_level=self.config['gate_level'],
+                num_heads=self.config['num_heads'],
+                num_layers=self.config['num_layers'],
+                num_classes=num_classes
+            )
+        elif self.model_type == 'clinical_notes':
+            model = IrregularClinicalNotesModel(
+                d_h=d_h, alpha=alpha,
+                model_name=self.config['text_model_name'],
+                max_length=self.config['max_text_length'],
+                num_heads=self.config['num_heads'],
+                num_layers=self.config['num_layers'],
+                num_classes=num_classes
+            )
+        elif self.model_type == 'multimodal':
+            model = MultimodalModel(
+                d_m=d_m, d_h=d_h, alpha=alpha,
+                num_classes=num_classes,
+                gate_level=self.config['gate_level'],
+                model_name=self.config['text_model_name'],
+                max_length=self.config['max_text_length'],
+                num_heads=self.config['num_heads'],
+                num_layers=self.config['num_layers'],
+                fusion_layers=self.config['fusion_layers']
+            )
+        else:
+            raise ValueError(f"Unknown model type: {self.model_type}")
+        
+        return model
+    
+    def _build_optimizer(self):
+        """Build optimizer with different learning rates for different components"""
+        param_groups = []
+        
+        # Different learning rates for pretrained vs new parameters
+        plm_params = []
+        other_params = []
+        
+        for name, param in self.model.named_parameters():
+            if 'text_encoder' in name and 'projection' not in name:
+                plm_params.append(param)
+            else:
+                other_params.append(param)
+        
+        if plm_params:
+            param_groups.append({
+                'params': plm_params,
+                'lr': self.config['plm_learning_rate']
+            })
+        
+        if other_params:
+            param_groups.append({
+                'params': other_params,
+                'lr': self.config['learning_rate']
+            })
+        
+        optimizer = optim.Adam(param_groups)
+        return optimizer
+    
+    def _build_criterion(self):
+        """Build loss function based on task"""
+        if self.task == '48ihm':
+            # Binary classification with class imbalance (1:7 ratio)
+            pos_weight = torch.tensor([7.0]).to(self.device)
+            return nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        else:  # 24phe
+            # Multi-label classification
+            return nn.BCEWithLogitsLoss()
+    
+    def train_epoch(self, epoch):
         """Train for one epoch"""
         self.model.train()
-        total_loss = 0
+        total_loss = 0.0
         num_batches = 0
         
-        pbar = tqdm(self.train_loader, desc="Training")
+        # Fine-tune PLM only in first 3 epochs for clinical notes
+        if hasattr(self.model, 'txt_model') or hasattr(self.model, 'text_encoder'):
+            freeze_plm = epoch >= 3
+            self._freeze_plm(freeze_plm)
+        
+        pbar = tqdm(self.train_loader, desc=f'Epoch {epoch+1}')
+        
         for batch in pbar:
             self.optimizer.zero_grad()
             
-            # Move data to device
-            ts_data = batch['ts_data'].to(self.device)
-            ts_times = batch['ts_times'].to(self.device)
-            notes_times = batch['notes_times'].to(self.device)
-            query_times = batch['query_times'].to(self.device)
-            labels = batch['labels'].to(self.device).squeeze()
-            notes_text = batch['notes_text']
-            
             # Forward pass
-            try:
-                logits = self.model(ts_data, ts_times, notes_text, notes_times, query_times)
-                logits = logits.squeeze()
-                
-                # Compute loss
-                loss = self.criterion(logits, labels.float())
-                
-                # Backward pass
-                loss.backward()
-                self.optimizer.step()
-                
-                total_loss += loss.item()
-                num_batches += 1
-                
-                pbar.set_postfix({'loss': loss.item()})
-                
-            except Exception as e:
-                print(f"Error in training batch: {e}")
-                continue
+            if self.model_type == 'time_series':
+                logits = self.model(
+                    batch['x_ts'].to(self.device),
+                    batch['t_ts'].to(self.device),
+                    self.global_means
+                )
+            elif self.model_type == 'clinical_notes':
+                logits = self.model(
+                    batch['clinical_notes'],
+                    batch['note_times']
+                )
+            else:  # multimodal
+                logits = self.model(
+                    batch['x_ts'].to(self.device),
+                    batch['t_ts'].to(self.device),
+                    self.global_means,
+                    batch['clinical_notes'],
+                    batch['note_times']
+                )
+            
+            # Compute loss
+            labels = batch['labels'].to(self.device)
+            loss = self.criterion(logits.squeeze(), labels.squeeze())
+            
+            # Backward pass
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            self.optimizer.step()
+            
+            total_loss += loss.item()
+            num_batches += 1
+            
+            # Update progress bar
+            pbar.set_postfix({'loss': loss.item()})
         
-        avg_loss = total_loss / max(num_batches, 1)
+        avg_loss = total_loss / num_batches
         self.train_losses.append(avg_loss)
+        
         return avg_loss
     
-    def evaluate(self, data_loader, split_name="Val"):
-        """Evaluate model on given data loader"""
+    def _freeze_plm(self, freeze):
+        """Freeze or unfreeze pretrained language model parameters"""
+        if hasattr(self.model, 'txt_model'):
+            for param in self.model.txt_model.text_encoder.text_encoder.parameters():
+                param.requires_grad = not freeze
+        elif hasattr(self.model, 'text_encoder'):
+            for param in self.model.text_encoder.text_encoder.parameters():
+                param.requires_grad = not freeze
+    
+    def evaluate(self, dataloader, split_name='val'):
+        """Evaluate model on given dataloader"""
         self.model.eval()
-        total_loss = 0
-        all_predictions = []
+        all_logits = []
         all_labels = []
-        num_batches = 0
+        total_loss = 0.0
         
         with torch.no_grad():
-            pbar = tqdm(data_loader, desc=f"Evaluating {split_name}")
-            for batch in pbar:
-                # Move data to device
-                ts_data = batch['ts_data'].to(self.device)
-                ts_times = batch['ts_times'].to(self.device)
-                notes_times = batch['notes_times'].to(self.device)
-                query_times = batch['query_times'].to(self.device)
-                labels = batch['labels'].to(self.device).squeeze()
-                notes_text = batch['notes_text']
+            for batch in tqdm(dataloader, desc=f'Evaluating {split_name}'):
+                # Forward pass
+                if self.model_type == 'time_series':
+                    logits = self.model(
+                        batch['x_ts'].to(self.device),
+                        batch['t_ts'].to(self.device),
+                        self.global_means
+                    )
+                elif self.model_type == 'clinical_notes':
+                    logits = self.model(
+                        batch['clinical_notes'],
+                        batch['note_times']
+                    )
+                else:  # multimodal
+                    logits = self.model(
+                        batch['x_ts'].to(self.device),
+                        batch['t_ts'].to(self.device),
+                        self.global_means,
+                        batch['clinical_notes'],
+                        batch['note_times']
+                    )
                 
-                try:
-                    # Forward pass
-                    logits = self.model(ts_data, ts_times, notes_text, notes_times, query_times)
-                    logits = logits.squeeze()
-                    
-                    # Compute loss
-                    loss = self.criterion(logits, labels.float())
-                    total_loss += loss.item()
-                    num_batches += 1
-                    
-                    # Store predictions and labels
-                    if self.config['task'] == 'mortality':
-                        predictions = torch.sigmoid(logits).cpu().numpy()
-                    else:  # phenotype
-                        predictions = torch.sigmoid(logits).cpu().numpy()
-                    
-                    all_predictions.extend(predictions)
-                    all_labels.extend(labels.cpu().numpy())
-                    
-                except Exception as e:
-                    print(f"Error in evaluation batch: {e}")
-                    continue
+                labels = batch['labels'].to(self.device)
+                loss = self.criterion(logits.squeeze(), labels.squeeze())
+                
+                total_loss += loss.item()
+                all_logits.append(logits.cpu())
+                all_labels.append(labels.cpu())
         
-        avg_loss = total_loss / max(num_batches, 1)
+        # Concatenate all predictions
+        all_logits = torch.cat(all_logits, dim=0)
+        all_labels = torch.cat(all_labels, dim=0)
         
         # Compute metrics
-        all_predictions = np.array(all_predictions)
-        all_labels = np.array(all_labels)
-        
-        if self.config['task'] == 'mortality':
-            # Binary classification metrics
-            auc = roc_auc_score(all_labels, all_predictions)
-            aupr = average_precision_score(all_labels, all_predictions)
-            f1 = f1_score(all_labels, all_predictions > 0.5)
-            
-            metrics = {'loss': avg_loss, 'auc': auc, 'aupr': aupr, 'f1': f1}
-            print(f"{split_name} - Loss: {avg_loss:.4f}, AUC: {auc:.4f}, AUPR: {aupr:.4f}, F1: {f1:.4f}")
-            
-        else:  # phenotype - multi-label
-            # Compute macro-averaged metrics
-            auc = roc_auc_score(all_labels, all_predictions, average='macro')
-            f1 = f1_score(all_labels, all_predictions > 0.5, average='macro')
-            
-            metrics = {'loss': avg_loss, 'auc': auc, 'f1': f1}
-            print(f"{split_name} - Loss: {avg_loss:.4f}, AUC: {auc:.4f}, F1: {f1:.4f}")
+        metrics = self._compute_metrics(all_logits, all_labels)
+        metrics['loss'] = total_loss / len(dataloader)
         
         return metrics
     
-    def train(self, num_epochs):
+    def _compute_metrics(self, logits, labels):
+        """Compute evaluation metrics based on task"""
+        if self.task == '48ihm':
+            # Binary classification metrics
+            probs = torch.sigmoid(logits).numpy()
+            preds = (probs > 0.5).astype(int)
+            labels_np = labels.numpy().astype(int)
+            
+            f1 = f1_score(labels_np, preds)
+            aupr = average_precision_score(labels_np, probs)
+            
+            return {'f1': f1, 'aupr': aupr}
+        
+        else:  # 24phe
+            # Multi-label classification metrics
+            probs = torch.sigmoid(logits).numpy()
+            preds = (probs > 0.5).astype(int)
+            labels_np = labels.numpy().astype(int)
+            
+            # Macro F1 and AUROC
+            f1_macro = f1_score(labels_np, preds, average='macro', zero_division=0)
+            auroc_macro = roc_auc_score(labels_np, probs, average='macro')
+            
+            return {'f1_macro': f1_macro, 'auroc_macro': auroc_macro}
+    
+    def train(self):
         """Main training loop"""
-        print(f"Training model for {num_epochs} epochs...")
+        print(f"Training {self.model_type} model for {self.task}")
         print(f"Device: {self.device}")
+        print(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
         
-        for epoch in range(num_epochs):
-            print(f"\nEpoch {epoch + 1}/{num_epochs}")
-            
+        # Training loop
+        epochs = self.config['epochs']
+        if self.model_type == 'clinical_notes' or self.model_type == 'multimodal':
+            epochs = min(epochs, 6)  # Clinical notes converge faster
+        
+        for epoch in range(epochs):
             # Train
-            train_loss = self.train_epoch()
+            train_loss = self.train_epoch(epoch)
             
-            # Evaluate
-            val_metrics = self.evaluate(self.val_loader, "Validation")
+            # Validate
+            val_metrics = self.evaluate(self.val_loader, 'val')
             
-            # Save best model
-            current_score = val_metrics['f1']  # Use F1 as main metric
-            if current_score > self.best_val_score:
-                self.best_val_score = current_score
-                torch.save(self.model.state_dict(), 'best_model.pt')
-                print(f"New best model saved with F1: {current_score:.4f}")
+            # Track best model
+            if self.task == '48ihm':
+                val_score = val_metrics['f1']
+            else:
+                val_score = val_metrics['f1_macro']
+            
+            if val_score > self.best_val_score:
+                self.best_val_score = val_score
+                self.save_checkpoint('best_model.pth')
+            
+            # Log metrics
+            print(f"Epoch {epoch+1}/{epochs}")
+            print(f"  Train Loss: {train_loss:.4f}")
+            for metric, value in val_metrics.items():
+                print(f"  Val {metric.upper()}: {value:.4f}")
+            
+            # Log to wandb if available
+            if wandb.run:
+                log_dict = {'epoch': epoch, 'train_loss': train_loss}
+                log_dict.update({f'val_{k}': v for k, v in val_metrics.items()})
+                wandb.log(log_dict)
         
-        # Load best model and evaluate on test set
-        self.model.load_state_dict(torch.load('best_model.pt'))
-        test_metrics = self.evaluate(self.test_loader, "Test")
+        # Final test evaluation
+        print("\nEvaluating on test set...")
+        test_metrics = self.evaluate(self.test_loader, 'test')
+        
+        print("Final Test Results:")
+        for metric, value in test_metrics.items():
+            print(f"  Test {metric.upper()}: {value:.4f}")
         
         return test_metrics
     
-    def plot_training_curves(self):
-        """Plot training and validation loss curves"""
-        plt.figure(figsize=(10, 6))
-        plt.plot(self.train_losses, label='Training Loss')
-        plt.plot(self.val_losses, label='Validation Loss')
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        plt.title('Training and Validation Loss')
-        plt.legend()
-        plt.grid(True)
-        plt.savefig('training_curves.png')
-        plt.show()
+    def save_checkpoint(self, filename):
+        """Save model checkpoint"""
+        os.makedirs(self.config['save_dir'], exist_ok=True)
+        checkpoint = {
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'config': self.config,
+            'best_val_score': self.best_val_score
+        }
+        torch.save(checkpoint, os.path.join(self.config['save_dir'], filename))
+    
+    def load_checkpoint(self, filename):
+        """Load model checkpoint"""
+        checkpoint_path = os.path.join(self.config['save_dir'], filename)
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.best_val_score = checkpoint['best_val_score']
 
-def main():
-    """Main training function"""
-    # Configuration
-    config = {
-        'data_path': 'data/processed/',
-        'task': 'mortality',  # or 'phenotype'
-        'batch_size': 32,
-        'learning_rate': 0.0004,
-        'num_epochs': 20,
-        'hidden_dim': 128,
-        'num_fusion_layers': 3,
-        'num_heads': 8,
-        'ff_dim': 512,
-        'max_seq_len': 48,
-        'max_notes': 5,
-        'ts_input_dim': 17  # Number of time series features
+
+def run_experiment(args):
+    """Run complete experiment"""
+    # Get configuration
+    config = get_config(args.task)
+    config.update(vars(args))
+    
+    # Initialize wandb if requested
+    if args.use_wandb:
+        wandb.init(
+            project=f"MultimodalMIMIC-{args.task}",
+            name=f"{args.model_type}_{args.seed}",
+            config=config
+        )
+    
+    # Set random seeds for reproducibility
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(args.seed)
+    
+    # Run training
+    trainer = Trainer(config, args.model_type, args.task)
+    test_metrics = trainer.train()
+    
+    # Save results
+    results = {
+        'task': args.task,
+        'model_type': args.model_type,
+        'seed': args.seed,
+        'test_metrics': test_metrics,
+        'config': config
     }
     
-    # Create datasets
-    train_dataset = MIMICDataset(
-        config['data_path'], 
-        split='train', 
-        task=config['task'],
-        max_seq_len=config['max_seq_len'],
-        max_notes=config['max_notes']
-    )
+    results_dir = os.path.join(config['save_dir'], 'results')
+    os.makedirs(results_dir, exist_ok=True)
     
-    val_dataset = MIMICDataset(
-        config['data_path'], 
-        split='val', 
-        task=config['task'],
-        max_seq_len=config['max_seq_len'],
-        max_notes=config['max_notes']
-    )
+    with open(os.path.join(results_dir, f'{args.model_type}_{args.seed}.json'), 'w') as f:
+        json.dump(results, f, indent=2)
     
-    test_dataset = MIMICDataset(
-        config['data_path'], 
-        split='test', 
-        task=config['task'],
-        max_seq_len=config['max_seq_len'],
-        max_notes=config['max_notes']
-    )
-    
-    # Create data loaders
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=config['batch_size'], 
-        shuffle=True, 
-        collate_fn=collate_fn
-    )
-    
-    val_loader = DataLoader(
-        val_dataset, 
-        batch_size=config['batch_size'], 
-        shuffle=False, 
-        collate_fn=collate_fn
-    )
-    
-    test_loader = DataLoader(
-        test_dataset, 
-        batch_size=config['batch_size'], 
-        shuffle=False, 
-        collate_fn=collate_fn
-    )
-    
-    # Create model
-    num_classes = 1 if config['task'] == 'mortality' else 25  # 25 phenotypes
-    model = MultimodalEHRModel(
-        ts_input_dim=config['ts_input_dim'],
-        hidden_dim=config['hidden_dim'],
-        num_fusion_layers=config['num_fusion_layers'],
-        num_heads=config['num_heads'],
-        ff_dim=config['ff_dim'],
-        max_seq_len=config['max_seq_len'],
-        num_classes=num_classes
-    )
-    
-    print(f"Model created with {sum(p.numel() for p in model.parameters())} parameters")
-    
-    # Create trainer and train
-    trainer = EHRTrainer(model, train_loader, val_loader, test_loader, config)
-    test_metrics = trainer.train(config['num_epochs'])
-    
-    print(f"\nFinal test results: {test_metrics}")
-    
-    # Plot training curves
-    trainer.plot_training_curves()
+    return test_metrics
 
-if __name__ == "__main__":
+
+def main():
+    parser = argparse.ArgumentParser(description='Train MultimodalMIMIC models')
+    parser.add_argument('--task', choices=['48ihm', '24phe'], default='48ihm',
+                       help='Prediction task')
+    parser.add_argument('--model_type', 
+                       choices=['time_series', 'clinical_notes', 'multimodal'],
+                       default='multimodal', help='Model type to train')
+    parser.add_argument('--seed', type=int, default=42,
+                       help='Random seed for reproducibility')
+    parser.add_argument('--data_path', type=str, required=True,
+                       help='Path to processed MIMIC-III data')
+    parser.add_argument('--save_dir', type=str, default='./checkpoints',
+                       help='Directory to save checkpoints')
+    parser.add_argument('--use_wandb', action='store_true',
+                       help='Use Weights & Biases for logging')
+    
+    args = parser.parse_args()
+    
+    # Run experiment
+    test_metrics = run_experiment(args)
+    print(f"\nFinal results: {test_metrics}")
+
+
+if __name__ == '__main__':
     main()
